@@ -82,7 +82,10 @@ def build(children_path, parents_path, output, encoder, batch_size=4):
     with tempfile.TemporaryDirectory(prefix=".dense-", dir=output.parent) as temp:
         stage = Path(temp) / "bundle"
         stage.mkdir()
-        faiss.write_index(index, str(stage / "children.faiss"))
+        try:
+            faiss.write_index(index, str(stage / "children.faiss"))
+        except RuntimeError:
+            (stage / "children.faiss").write_bytes(faiss.serialize_index(index))
         np.save(stage / "embeddings.npy", vectors, allow_pickle=False)
         write_jsonl(stage / "children.jsonl", children)
         write_jsonl(stage / "parents.jsonl", parents)

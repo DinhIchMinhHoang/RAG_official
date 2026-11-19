@@ -19,7 +19,13 @@ class DenseRetriever:
                 raise ValueError(f"{name} đã thay đổi; cần rebuild index.")
         self.children, parents = load_corpus(path / "children.jsonl", path / "parents.jsonl")
         self.parents = {r["parent_id"]: r for r in parents}
-        self.index = faiss.read_index(str(path / "children.faiss"))
+        faiss_file = path / "children.faiss"
+        try:
+            self.index = faiss.read_index(str(faiss_file))
+        except RuntimeError:
+            # Fallback for Windows Unicode paths (e.g. Vietnamese accented folder names)
+            import numpy as np
+            self.index = faiss.deserialize_index(np.frombuffer(faiss_file.read_bytes(), dtype=np.uint8))
         if self.index.ntotal != len(self.children) or self.index.d != self.metadata["dimension"]:
             raise ValueError("Index và metadata không khớp.")
         self.encoder = encoder if encoder is not None else Embedder(
