@@ -50,9 +50,30 @@ def clean_title(t):
     return re.sub(r"-[0-9a-f]{6}$", "", t or "")  # drop the doc_id hash suffix
 
 
+MARKERS = {"figure": "[hình]", "formula": "[công thức]", "code": "[mã]", "table": "[bảng]"}
+
+
 def _src_line(c):
+    mk = "".join(f" {MARKERS[t]}" for t in c.get("types") or ())
     return (f"[{c['source_id']}] {clean_title(c.get('title') or c.get('doc_id'))} (doc {c.get('doc_id')}) "
-            f"{fmt_pages(c.get('page_start'), c.get('page_end'))} | {c.get('breadcrumb') or ''}")
+            f"{fmt_pages(c.get('page_start'), c.get('page_end'))}{mk} | {c.get('breadcrumb') or ''}")
+
+
+def source_extras(contexts, parents, store):
+    """Per context: content `types` / `assets` / `languages` of its matched children, read from
+    <store>/corpus/children.jsonl (shortcut: re-read per ask; search() results carry no child metadata)."""
+    f = Path(store) / "corpus" / "children.jsonl" if store else None
+    kids = {k["child_id"]: k for k in ing._read_jsonl(f)} if f else {}
+    by_parent = {p["parent_id"]: p.get("matched_child_ids") or [] for p in parents}
+    out = []
+    for c in contexts:
+        ks = [kids[i] for i in by_parent.get(c["parent_id"], []) if i in kids]
+        assets = [x for k in ks for x in k.get("assets") or []]
+        langs = sorted({x for k in ks for x in k.get("languages") or []})
+        have = {k.get("content_type") for k in ks} | {x["type"] for x in assets} | ({"code"} if langs else set())
+        out.append({**({"types": [t for t in MARKERS if t in have]} if have & MARKERS.keys() else {}),
+                    **({"assets": assets} if assets else {}), **({"languages": langs} if langs else {})})
+    return out
 
 
 def resolve_rerank(mode, n_docs):
@@ -121,6 +142,7 @@ def ask_once(question, col, llm, a, counter, history=None, out=None):
           else "\n(Không truy xuất được đoạn nào; không gọi LLM.)")
     else:
         contexts = assemble_contexts(res["parents"], counter, a.budget_tokens)
+        extras = source_extras(contexts, res["parents"], getattr(a, "store", None))
         final = None
         for ev in llm.stream_chat(build_messages(question, contexts, history), stage="answer"):
             if ev["type"] == "token":
@@ -138,11 +160,11 @@ def ask_once(question, col, llm, a, counter, history=None, out=None):
                  sources=[{"source_id": c["source_id"], "doc_id": c["doc_id"], "title": c["title"],
                            "page_start": c["page_start"], "page_end": c["page_end"],
                            "breadcrumb": c["breadcrumb"], "cited": c["source_id"] in cited,
-                           "truncated": c["truncated"]} for c in contexts])
+                           "truncated": c["truncated"], **x} for c, x in zip(contexts, extras)])
         r["timings_ms"]["ttft"] = None if final.get("t_first_token_s") is None else final["t_first_token_s"] * 1000
         p("\nNguồn:")
-        for c in contexts:
-            p(f"  {_src_line(c)}{'  (đã trích dẫn)' if c['source_id'] in cited else ''}")
+        for c, x in zip(contexts, extras):
+            p(f"  {_src_line({**c, **x})}{'  (đã trích dẫn)' if c['source_id'] in cited else ''}")
         p(f"\nCờ: refused={r['refused']} invalid_citations={r['invalid_citations']} truncated={r['truncated']}")
     r["timings_ms"]["total"] = (time.perf_counter() - t0) * 1000
     t, u = r["timings_ms"], r["usage"] or {}

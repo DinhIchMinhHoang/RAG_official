@@ -105,7 +105,7 @@ def ingest_file(path, store, count_tokens, ceiling=400, force=False, parse_fn=No
     save_registry(store, reg)
     return {"doc_id": doc_id, "path": str(path), "status": "ok", **{k: info[k] for k in
             ("pages", "blocks", "parents", "children", "max_tokens")}, "parse_s": parse_s, "chunk_s": chunk_s,
-            "replaced": stale, "_payload": payload, "_parents": parents, "_children": children}
+            "replaced": stale, "_parsed_dir": str(store / "parsed" / doc_id), "_payload": payload, "_parents": parents, "_children": children}
 
 
 def ingest_paths(paths, store, count_tokens, ceiling=400, force=False, parse_fn=None, out=print):
@@ -241,6 +241,10 @@ def mirror_stack(results, settings=None, out=print):
             objects.put_file(mc, s.minio_bucket, path, objects.raw_key(sha, path.name))
             objects.put_bytes(mc, s.minio_bucket, json.dumps(r["_payload"], ensure_ascii=False).encode("utf-8"),
                               objects.blocks_key(doc_id), "application/json")
+            assets = Path(r.get("_parsed_dir") or "") / "assets"
+            for f in sorted(assets.rglob("*")) if r.get("_parsed_dir") and assets.is_dir() else ():
+                if f.is_file():
+                    objects.put_file(mc, s.minio_bucket, f, f"assets/{doc_id}/{f.relative_to(assets).as_posix()}")
             out(f"stack: đã đồng bộ {doc_id}")
         except Exception as e:
             out(f"CẢNH BÁO: stack không đồng bộ được {r['doc_id']}: {type(e).__name__}: {str(e)[:150]}")
