@@ -1,0 +1,11 @@
+# own venv: engines/glm/.venv (or RAG_ENGINE_GLM_PYTHON). Versions measured working (RAG_lab/.venv-glmocr).
+# torch/torchvision first, from the CUDA 12.6 index:
+#   pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu126
+# then: pip install -r requirements.txt   (torch lines below are comments so a plain install does not pull CPU wheels)
+# torch==2.14.1+cu126
+# torchvision==0.29.1+cu126
+transformers==5.24.0
+accelerate==1.16.0
+safetensors==0.8.0
+huggingface_hub==2.4.0
+pillow==13.0.0

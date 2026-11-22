@@ -1,0 +1,6 @@
+# own venv: engines/docling/.venv (or RAG_ENGINE_DOCLING_PYTHON). Versions measured working (RAG_lab/.venv-docling).
+# torch first (CUDA 12.6 index), otherwise docling pulls a default torch:
+#   pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu126
+# torch==2.14.1+cu126
+# torchvision==0.29.1+cu126
+docling==2.151.1
