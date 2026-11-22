@@ -191,6 +191,9 @@ def build(articles: list[dict]):
 def main(path: str):
     src = Path(path)
     articles = group_articles(normalize(src.read_text(encoding="utf-8")))
+    if not articles:
+        print("LOI: khong tim thay Dieu nao; khong ghi file. Dung parser.chunker cho tai lieu tong quat.", file=sys.stderr)
+        sys.exit(2)
     parents, children = build(articles)
     for name, rows in (("parents", parents), ("children", children)):
         with open(src.with_name(f"{name}.jsonl"), "w", encoding="utf-8") as f:

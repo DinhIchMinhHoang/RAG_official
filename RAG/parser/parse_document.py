@@ -164,14 +164,42 @@ def image_to_pil(data: bytes | str | Path | Any):
     return img
 
 
+OCR_ENGINE_NAME = "Tesseract"
+_WIN_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+# OCR env vars: TESSERACT_CMD (path to tesseract binary; else PATH; else the
+# default Windows install path), TESSDATA_PREFIX (folder with *.traineddata),
+# OCR_LANG (tesseract languages, default "vie+eng").
 class OCR:
     def __init__(self):
+        import os
+        import shutil
+
         import pytesseract
 
-        self.engine = pytesseract
-        self.engine.pytesseract.tesseract_cmd = (
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        cmd = (
+            os.environ.get("TESSERACT_CMD")
+            or shutil.which("tesseract")
+            or (_WIN_TESSERACT if os.path.exists(_WIN_TESSERACT) else None)
         )
+        if not cmd:
+            raise RuntimeError(
+                "Tesseract not found. Set env TESSERACT_CMD to the tesseract binary, "
+                "add tesseract to PATH, or install it at " + _WIN_TESSERACT
+            )
+        self.engine = pytesseract
+        self.engine.pytesseract.tesseract_cmd = cmd
+        self.lang = os.environ.get("OCR_LANG") or "vie+eng"
+        available = set(self.engine.get_languages())
+        missing = [l for l in self.lang.split("+") if l not in available]
+        if missing:
+            raise RuntimeError(
+                f"Tesseract language(s) missing: {', '.join(missing)} (available: "
+                f"{', '.join(sorted(available))}). Download <lang>.traineddata (e.g. "
+                "vie.traineddata) into the tessdata folder, point env TESSDATA_PREFIX "
+                "at it, or set OCR_LANG to installed languages."
+            )
 
     def run(self, data):
         from pytesseract import Output
@@ -181,7 +209,7 @@ class OCR:
 
         result = self.engine.image_to_data(
             img,
-            lang="vie+eng",
+            lang=self.lang,
             config="--oem 1 --psm 6",
             output_type=Output.DICT
         )
@@ -440,7 +468,7 @@ def parse_pdf(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]]
             if not b:
                 counts["empty_pages"] += 1
             out.extend(b)
-            print(f"[parse] Trang {idx}/{len(doc)}: {'RapidOCR' if scanned else 'PyMuPDF4LLM'} - {len(b)} blocks", flush=True)
+            print(f"[parse] Trang {idx}/{len(doc)}: {OCR_ENGINE_NAME if scanned else 'PyMuPDF4LLM'} - {len(b)} blocks", flush=True)
     return out, dict(counts)
 
 
