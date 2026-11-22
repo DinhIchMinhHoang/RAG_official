@@ -31,16 +31,16 @@ Ghi chú: `reasoning none` là bắt buộc, không phải tối ưu. Với reas
 
 ```mermaid
 flowchart LR
-    A[PDF/DOCX/...] --> P[parser/parse_document.py<br/>execute -> blocks JSON]
-    P --> S[parser/split_articles.py<br/>regex Dieu/Khoan]
-    S --> PJ[parents.jsonl / children.jsonl]
-    PJ --> B[embed/build_bm25.py<br/>BM25 plain]
-    PJ --> D[embed/build_dense.py<br/>bge-m3, max_length 1024]
-    B --> H[embed/search_hybrid.py<br/>RRF dense+BM25]
+    A["PDF/DOCX/..."] --> P["parser/parse_document.py<br/>execute: blocks JSON"]
+    P --> S["parser/split_articles.py<br/>regex Dieu/Khoan"]
+    S --> PJ["parents.jsonl / children.jsonl"]
+    PJ --> B["embed/build_bm25.py<br/>BM25 plain"]
+    PJ --> D["embed/build_dense.py<br/>bge-m3, max_length 1024"]
+    B --> H["embed/search_hybrid.py<br/>RRF dense+BM25"]
     D --> H
-    H --> R[llm/retrieve.py + llm/rerank.py]
-    R --> G[llm/generate.py + llm/prompt.py<br/>Gemini]
-    G --> API[api.py FastAPI]
+    H --> R["llm/retrieve.py + llm/rerank.py"]
+    R --> G["llm/generate.py + llm/prompt.py<br/>Gemini"]
+    G --> API["api.py FastAPI"]
 ```
 
 ### 3.2 File (không đổi trên nhánh, trừ ghi chú)
@@ -76,21 +76,22 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    F[tệp hoặc thư mục<br/>cli.py ingest] --> X[ingest.expand_paths<br/>SUPPORTED, bỏ thư mục 'processed']
-    X --> H{sha256 đã có<br/>trong documents.json?}
-    H -- có, không --force --> SK[status skip]
-    H -- không --> PD[parser.parse_document.execute<br/>PDF text / OCR Tesseract vie / DOCX / HTML / MD ...]
-    PD --> PB[store/parsed/doc_id/ blocks JSON]
-    PB --> CH[parser.chunker.chunk_document<br/>cây tiêu đề, ceiling 400 token bge-m3]
-    CH -->|ChunkingError| FAIL[!!! THẤT BẠI, tiếp tài liệu khác, exit 2]
-    CH --> MG[ingest.merge_corpus<br/>store/corpus/children.jsonl, parents.jsonl]
-    MG --> RG[documents.json registry]
-    RG --> IX{index_is_current?}
-    IX -- không --> BI[rebuild_index<br/>faiss: index.tmp rồi os.replace<br/>qdrant: drop + recreate 3 collection]
-    IX -- có --> NC[bỏ qua]
-    BI --> ST{--stack?}
-    ST -- có --> MS[mirror_stack: Postgres + MinIO]
-    ST -- không --> TB[format_table]
+    F["tệp hoặc thư mục<br/>cli.py ingest"] --> X["ingest.expand_paths<br/>SUPPORTED, bỏ thư mục processed"]
+    X --> H{"sha256 đã có<br/>trong documents.json?"}
+    H -->|"có (không dùng --force)"| SK["status skip"]
+    H -->|không| PD["parser.parse_document.execute<br/>PDF text / OCR Tesseract vie / DOCX / HTML / MD"]
+    PD --> PB["store/parsed/doc_id/ blocks JSON"]
+    PB --> CH["parser.chunker.chunk_document<br/>cây tiêu đề, ceiling 400 token bge-m3"]
+    CH -->|ChunkingError| FAIL["THẤT BẠI: báo lỗi, tiếp tài liệu khác, exit 2"]
+    CH --> MG["ingest.merge_corpus<br/>store/corpus/children.jsonl, parents.jsonl"]
+    MG --> RG["documents.json registry"]
+    RG --> IX{"index_is_current?"}
+    IX -->|không| BI["rebuild_index<br/>faiss: index.tmp rồi os.replace<br/>qdrant: drop + recreate 3 collection"]
+    IX -->|có| NC["bỏ qua"]
+    BI --> ST{"dùng --stack?"}
+    NC --> ST
+    ST -->|có| MS["mirror_stack: Postgres + MinIO"]
+    ST -->|không| TB["format_table"]
     MS --> TB
 ```
 
@@ -98,23 +99,23 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Q[câu hỏi<br/>cli.py ask / chat] --> E[bge-m3 encode_query]
-    E --> D[dense top candidate_k=100]
-    Q --> B1[BM25 có dấu]
-    Q --> B2[BM25 bỏ dấu 'bm25_stripped']
-    D --> FU[fusion: RRF k=60 hoặc convex alpha]
+    Q["câu hỏi<br/>cli.py ask / chat"] --> E["bge-m3 encode_query"]
+    E --> D["dense top candidate_k=100"]
+    Q --> B1["BM25 có dấu"]
+    Q --> B2["BM25 bỏ dấu bm25_stripped"]
+    D --> FU["fusion: RRF k=60 hoặc convex alpha"]
     B1 --> FU
     B2 --> FU
-    FU --> RR{rerank?<br/>on / off / auto: on khi >=2 tài liệu}
-    RR -- có --> RK[bge-reranker-v2-m3<br/>pool 50 CHILD, trước khi gom parent]
-    RR -- không --> GP
-    RK --> GP[gom theo parent, max_parents=3<br/>--doc: lọc theo doc_id]
-    GP --> GT{--min-cosine?<br/>cosine top1 thấp}
-    GT -- chặn --> RF[REFUSAL_TEXT, không gọi LLM]
-    GT -- qua --> AC[assemble_contexts<br/>ngân sách 3500 token, S1..Sn]
-    AC --> LL[LLMClient.stream_chat<br/>text-only, stream]
-    LL --> PA[parse_answer<br/>citations, invalid_citations, refused]
-    PA --> OUT[Câu trả lời + Nguồn + cờ + thời gian]
+    FU --> RR{"rerank?<br/>on / off / auto (bật khi có từ 2 tài liệu)"}
+    RR -->|có| RK["bge-reranker-v2-m3<br/>pool 50 CHILD, trước khi gom parent"]
+    RR -->|không| GP
+    RK --> GP["gom theo parent, max_parents=3<br/>--doc: lọc theo doc_id"]
+    GP --> GT{"--min-cosine?<br/>cosine top1 thấp"}
+    GT -->|chặn| RF["REFUSAL_TEXT, không gọi LLM"]
+    GT -->|qua| AC["assemble_contexts<br/>ngân sách 3500 token, S1..Sn"]
+    AC --> LL["LLMClient.stream_chat<br/>text-only, stream"]
+    LL --> PA["parse_answer<br/>citations, invalid_citations, refused"]
+    PA --> OUT["Câu trả lời + Nguồn + cờ + thời gian"]
 ```
 
 ### 4.3 Bản đồ module
