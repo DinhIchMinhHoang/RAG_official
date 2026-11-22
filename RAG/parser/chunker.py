@@ -13,7 +13,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-ATOMIC = {"table", "code", "formula"}
+ATOMIC = {"table", "code", "formula", "figure"}
 CHAPTER_RE = re.compile(r"^(?:Chương|CHƯƠNG)\s+([IVXLC]+)\b\s*[.:\-]?\s*(.*)$")
 ARTICLE_RE = re.compile(r"^(?:Điều|ĐIỀU)\s+(\d+)\s*[.:]\s*(.*)$")
 NUM_RE = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+\S")
@@ -206,7 +206,7 @@ def _sections(blocks, legal):
     for i, b in enumerate(blocks):
         text = _clean(b.get("text"))
         if i not in heads:
-            if text:
+            if text or b.get("asset"):  # figure khong chu van can giu de con tro toi asset
                 cur.append(b)
             continue
         text = text.split("\n")[0][:120].strip()  # thanh phan breadcrumb: chi dong dau
@@ -302,8 +302,14 @@ def _split_lines(text, ctype, limit, ct):
     return pieces
 
 
+def _btext(b):
+    """Code giu nguyen thut dong dau; loai khac strip()."""
+    t = b.get("text") or ""
+    return t.rstrip("\n") if b.get("type") == "code" else t.strip()
+
+
 def _units(b, ceiling, ct):
-    text, ctype = b["text"].strip(), b.get("type", "paragraph")
+    text, ctype = _btext(b), b.get("type", "paragraph")
     t = ct(text)
     if t <= ceiling:
         parts = [text]
@@ -313,7 +319,8 @@ def _units(b, ceiling, ct):
         parts = _split_text(text, ceiling, ct)
     page = (b.get("location") or {}).get("page_num")
     return [{"text": p, "tok": ct(p), "id": b["id"], "page": page, "bbox": b.get("bbox"),
-             "type": ctype if ctype in ATOMIC else "text"} for p in parts]
+             "type": ctype if ctype in ATOMIC else "text", "btype": ctype, "asset": b.get("asset"),
+             "lang": (b.get("metadata") or {}).get("language")} for p in parts]
 
 
 def _pack(units, ceiling, min_tokens):
@@ -370,12 +377,12 @@ def chunk_document(blocks, doc_id, count_tokens, ceiling=400, hard_max=1000, min
             continue
         if not bl:
             continue
-        tot = sum(ct(b["text"].strip()) for b in bl)
+        tot = sum(ct(_btext(b)) for b in bl)
         windows = [bl]
         if not sec["path"] or tot > PARENT_MAX:
             windows, cur, cur_t = [], [], 0
             for b in bl:
-                t = ct(b["text"].strip())
+                t = ct(_btext(b))
                 if cur and cur_t + t > PARENT_WINDOW:
                     windows.append(cur)
                     cur, cur_t = [], 0
@@ -390,11 +397,21 @@ def chunk_document(blocks, doc_id, count_tokens, ceiling=400, hard_max=1000, min
             extra = {"chapter": sec["chapter"], "chapter_title": sec["chapter_title"],
                      "article": sec["article"]} if legal else {}
             parents.append({"parent_id": pid, "doc_id": doc_id, "title": title, "breadcrumb": crumb,
-                            "text": "\n".join(([title] if title else []) + [b["text"].strip() for b in w]),
+                            "text": "\n".join(([title] if title else []) + [_btext(b) for b in w if _btext(b)]),
                             "page_start": ps, "page_end": pe, **extra})
             units = [u for b in w for u in _units(b, ceiling, ct)]
+            groups, pend = [], []
             for g in _pack(units, ceiling, min_tokens):
-                text = "\n".join(u["text"] for u in g)
+                if any(u["text"].strip() for u in g):
+                    groups.append(pend + g)
+                    pend = []
+                elif groups:  # nhom chi co figure rong: gop vao nhom truoc (hoac nhom sau)
+                    groups[-1] = groups[-1] + g
+                else:
+                    pend = pend + g
+            assigned.update(u["id"] for u in pend)  # ca window rong: khong co child
+            for g in groups:
+                text = "\n".join(u["text"] for u in g if u["text"])
                 ps, pe = _page_info([u["page"] for u in g])
                 boxes = [u["bbox"] for u in g if u["bbox"] and u["page"] == ps]
                 types = {u["type"] for u in g}
@@ -406,7 +423,11 @@ def chunk_document(blocks, doc_id, count_tokens, ceiling=400, hard_max=1000, min
                     "bbox": [min(x[0] for x in boxes), min(x[1] for x in boxes),
                              max(x[2] for x in boxes), max(x[3] for x in boxes)] if boxes else None,
                     "block_ids": ids, "tokens": ct(text),
-                    "content_type": types.pop() if len(types) == 1 else "mixed", **extra})
+                    "content_type": types.pop() if len(types) == 1 else "mixed", **extra,
+                    "assets": [{"block_id": u["id"], "type": u["btype"], "asset": u["asset"], "bbox": u["bbox"],
+                                "page": u["page"]} for u in {u["id"]: u for u in g if u["asset"] and u["btype"] in (
+                                    "formula", "figure")}.values()],
+                    "languages": sorted({u["lang"] for u in g if u["btype"] == "code" and u["lang"]})})
     _stats.clear()
     _stats.update(skipped_sections=skipped, skipped_blocks=n_skipped, noise_blocks=noise)
     if not children:

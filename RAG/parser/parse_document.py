@@ -17,14 +17,16 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 from io import BytesIO
 import json
+import logging
 import math
 from pathlib import Path
 import re
 import unicodedata
 from typing import Any, Iterable
 
-PARSER_VERSION = "2.0.0"
+PARSER_VERSION = "3.0.0"
 MIN_PDF_TEXT = 20
+MAX_DRAWINGS = 5000  # per page; above this vector-figure detection is skipped
 MAX_OCR_SIDE = 2400
 SUPPORTED = {".pdf", ".docx", ".pptx", ".html", ".htm", ".md", ".txt", ".png", ".jpg", ".jpeg"}
 CHAPTER = re.compile(r"^Chương\s+([IVXLCDM]+|\d+)\b\s*[.:-]?\s*(.*)$", re.I)
@@ -36,12 +38,24 @@ MD_HEADING = re.compile(r"^(#{1,6})\s+(.+)$")
 PAGE_NUMBER = re.compile(r"^(?:trang\s*)?\d{1,3}(?:\s*/\s*\d{1,3})?$", re.I)
 
 
-def clean(s: str) -> str:
+_CTRL = re.compile("[\u0000-\u0008\u000b\u000c\u000e-\u001f\u200b-\u200d\ufeff\u00ad]")
+_LIGA = re.compile("[\ufb00-\ufb06]")
+_TAGS = re.compile(r"</?(mark|br|sup|sub|u)\b[^>]*>|<!--.*?-->", re.I | re.S)
+
+
+def clean_text(s: str) -> str:
+    """Cleanup for NON-code text (never collapses newlines; never use on code)."""
     s = unicodedata.normalize("NFC", s or "")
-    s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+    s = _CTRL.sub("", s)
+    s = _LIGA.sub(lambda m: unicodedata.normalize("NFKC", m.group()), s)
+    s = _TAGS.sub("", s.replace("\u00a0", " "))
+    s = re.sub("\u00af(\\w)", "\\1\u0304", s)
+    return re.sub(r"[ \t]+", " ", s)
+
+
+def clean(s: str) -> str:
+    s = clean_text((s or "").replace("\r\n", "\n").replace("\r", "\n"))
+    return re.sub(r"\n{3,}", "\n\n", s).strip()
 
 
 def sha256(path: Path) -> str:
@@ -55,22 +69,26 @@ def sha256(path: Path) -> str:
 @dataclass
 class ContentBlock:
     id: str
-    type: str  # heading | paragraph | table | list | image_ocr
+    type: str  # heading | paragraph | table | list | code | formula | figure | image_ocr
     text: str
     level: int = 0
     location: dict[str, int] = field(default_factory=dict)
     breadcrumb: str = ""
     bbox: list[float] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    asset: str | None = None
 
 
 def make_block(kind: str, text: str, *, page_num: int | None = None,
                slide_num: int | None = None, level: int = 0,
-               bbox: list[float] | None = None, **metadata: Any) -> ContentBlock:
+               bbox: list[float] | None = None, verbatim: bool = False,
+               asset: str | None = None, **metadata: Any) -> ContentBlock:
     location = {"page_num": page_num} if page_num is not None else (
         {"slide_num": slide_num} if slide_num is not None else {})
-    return ContentBlock(id="", type=kind, text=clean(text), level=min(max(level, 0), 3),
-                        location=location, bbox=bbox, metadata=metadata)
+    # code is verbatim; table cells are already cleaned cell by cell (keeps <br>).
+    body = text.strip("\n").rstrip() if verbatim or kind == "table" else clean(text)
+    return ContentBlock(id="", type=kind, text=body, level=min(max(level, 0), 3),
+                        location=location, bbox=bbox, metadata=metadata, asset=asset)
 
 
 def read_text_file(path: Path) -> tuple[str, str]:
@@ -107,7 +125,60 @@ def detect_type(text: str, initial: str = "paragraph", level: int = 0) -> tuple[
 def parse_markdown_blocks(md: str, *, page_num: int | None = None,
                           slide_num: int | None = None,
                           source: str = "text") -> list[ContentBlock]:
-    """Parse headings, paragraphs, list items and Markdown tables in source order."""
+    """Parse headings, paragraphs, list items, tables, fenced code and $$/\\[ math in source order."""
+    out: list[ContentBlock] = []
+    # Fences/math are extracted from the RAW text first so cleaning never touches code.
+    raw = (md or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    text_lines: list[str] = []
+
+    def flush_text():
+        if text_lines:
+            out.extend(_parse_md_text("\n".join(text_lines), page_num, slide_num, source))
+            text_lines.clear()
+
+    i = 0
+    while i < len(raw):
+        line = raw[i]
+        s = line.strip()
+        fm = re.match(r"^\s{0,3}(`{3,}|~{3,})\s*([^\s`]*)", line)
+        if fm:
+            fence, lang = fm.group(1), fm.group(2)
+            body, i = [], i + 1
+            while i < len(raw) and not re.fullmatch(r"\s{0,3}" + re.escape(fence[0]) + "{%d,}\\s*" % len(fence), raw[i]):
+                body.append(raw[i])
+                i += 1
+            i += 1  # closing fence (or EOF)
+            flush_text()
+            if "".join(body).strip():
+                out.append(make_block("code", "\n".join(body), page_num=page_num, slide_num=slide_num,
+                                      verbatim=True, language=lang, source=source))
+            continue
+        opener, closer = ("$$", "$$") if s.startswith("$$") else (("\\[", "\\]") if s.startswith("\\[") else (None, None))
+        if opener:
+            rest, j, body = s[2:], i, []
+            while True:
+                if closer in rest:
+                    body.append(rest.split(closer, 1)[0])
+                    break
+                body.append(rest)
+                j += 1
+                if j >= len(raw):
+                    body = None
+                    break
+                rest = raw[j].strip()
+            if body is not None and "\n".join(body).strip():
+                flush_text()
+                out.append(make_block("formula", "\n".join(body).strip(), page_num=page_num,
+                                      slide_num=slide_num, verbatim=True, format="latex", source=source))
+                i = j + 1
+                continue
+        text_lines.append(line)
+        i += 1
+    flush_text()
+    return out
+
+
+def _parse_md_text(md: str, page_num, slide_num, source) -> list[ContentBlock]:
     lines = clean(md).splitlines()
     out: list[ContentBlock] = []
     buffer: list[str] = []
@@ -374,38 +445,382 @@ def ocr_lines_to_blocks(lines: list[dict[str, Any]], *, page_num: int | None = N
     return result
 
 
-def get_pdf_text_blocks(page: Any, page_num: int) -> list[ContentBlock]:
-    """PyMuPDF4LLM for born-digital page; fitz used only for image/order metadata."""
-    import pymupdf4llm
-    # Disable PyMuPDF4LLM automatic OCR: the RapidOCR pass below decides that.
+def get_pdf_text_blocks(page: Any, page_num: int, ocr: Any = None,
+                        asset_dir: Path | str | None = None, stats: dict | None = None) -> list[ContentBlock]:
+    """Born-digital page -> blocks in MuPDF raw order (see extract_pdf_page)."""
+    import tempfile
+    return extract_pdf_page(page, page_num, asset_dir or tempfile.mkdtemp(prefix="rag_assets_"), ocr, stats)
+
+
+_MONO = re.compile(r"mono|courier|consolas|menlo|typewriter|^(SF|CM|LM|VN)TT|mn-regular", re.I)
+_STRONG_MATH = re.compile(r"^(CM(MI|SY|EX|MIB|BSY)|MSAM|MSBM|EUFM|LMMath|PazoMath|.*Math)", re.I)
+_MATHISH = re.compile(r"^(CMSS|CMSSI|CMR)", re.I)
+_MATH_CHARS = "=+−<>≈≠≤≥∈∑∏±×÷·¯∞/^_"
+_BOLD = re.compile(r"bold|black|heavy|medi\b|demi|-bd\b", re.I)
+_LIST_MARK = re.compile(r"^\s*([-–•*·]|\d+[.)])\s+")
+_FOOTERS = (re.compile(r"^\s*(trang\s+|page\s+)?\d{1,4}\s*(/|of|trên)\s*\d{1,4}\s*$", re.I),
+            re.compile(r"^\s*-?\s*\d{1,4}\s*-?\s*$"))
+_CAPTION = re.compile(r"^(Figure|Fig\.|Hình|Biểu đồ|Chart)\s*\d+", re.I)
+_CODE_CHARS = "=(){};$>#"
+_NO_PRUNE = {"heading", "code", "formula", "figure", "table"}
+
+
+class _Ln:
+    """One text line: spans keep raw chars; text has spaces re-inserted where a real gap exists."""
+
+
+def _make_line(l: dict, midx: int, pos: int):
+    spans, prev = [], None
+    for s in l.get("spans", []):
+        chars = s.get("chars") or []
+        if not chars:
+            continue
+        parts = []
+        for c in chars:
+            ch = c["c"]
+            # PDFs with a missing space glyph: a real gap >= 0.20em means a space (also across spans).
+            if prev and ch.strip() and prev[0].strip() and s["size"] > 0 and c["bbox"][0] - prev[1] >= 0.2 * s["size"]:
+                parts.append(" ")
+            parts.append(ch)
+            prev = (ch, c["bbox"][2])
+        spans.append({"font": re.sub(r"^[A-Z]{6}\+", "", s.get("font", "")), "size": s["size"],
+                      "flags": s["flags"], "text": "".join(parts), "chars": chars})
+    nb = [s for s in spans if s["text"].strip()]
+    if not nb:
+        return None
+    ln = _Ln()
+    ln.spans, ln.nb, ln.midx, ln.pos = spans, nb, midx, pos
+    ln.x0, ln.y0, ln.x1, ln.y1 = l["bbox"]
+    ln.cx, ln.cy = (ln.x0 + ln.x1) / 2, (ln.y0 + ln.y1) / 2
+    weight = Counter()
+    for s in nb:
+        weight[round(s["size"], 1)] += len(s["text"].strip())
+    ln.size = weight.most_common(1)[0][0]
+    ln.bold = all(s["flags"] & 16 or _BOLD.search(s["font"]) for s in nb)
+    ln.text = "".join(s["text"] for s in spans).strip()
+    ln.raw = "".join(c["c"] for s in spans for c in s["chars"])
+    ln.code = False
+    strong = [s for s in nb if _STRONG_MATH.match(s["font"])]
+    # text fonts (CMR/CMSS) count as prose; without a strong span a line seeds only if it has a math
+    # symbol or is a 1-2 letter variable (never pure digits: axis ticks).
+    prose = " ".join(s["text"] for s in nb if s not in strong)
+    weak = any(_MATHISH.match(s["font"]) for s in nb) and (
+        any(c in _MATH_CHARS for c in ln.text) or (ln.text.isalpha() and len(ln.text) <= 2))
+    # shortcut: lines with a strong math span AND a prose word >=4 letters stay text (inline math).
+    # (>=4-letter word, or two >=3-letter words, marks prose; spec says only the 4-letter rule)
+    ln.seed = bool(strong or weak) and not (re.search(r"[^\W\d_]{4,}", prose)
+                                               or len(re.findall(r"[^\W\d_]{3,}", prose)) >= 2)
+    return ln
+
+
+def _hit(a, b) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _within(a, b, tol=1.0) -> bool:
+    return a[0] >= b[0] - tol and a[1] >= b[1] - tol and a[2] <= b[2] + tol and a[3] <= b[3] + tol
+
+
+def _doc_font_stats(doc) -> tuple[float, list[float]]:
+    """(body size, heading sizes desc) from a sample of pages; cached on the doc object."""
+    import pymupdf as fitz
+    cached = getattr(doc, "_rag_font_stats", None)
+    if cached:
+        return cached
+    n = doc.page_count
+    pages = range(n) if n <= 40 else sorted({int(i * (n - 1) / 39) for i in range(40)})
+    weight = Counter()
+    for i in pages:
+        for b in doc[i].get_text("dict", flags=fitz.TEXTFLAGS_TEXT)["blocks"]:
+            for ln in b.get("lines", []):
+                for s in ln["spans"]:
+                    t = len(s["text"].strip())
+                    if t:
+                        weight[round(s["size"] * 2) / 2] += t
+    body = weight.most_common(1)[0][0] if weight else 10.0
+    stats = (body, sorted({k for k in weight if k >= 1.2 * body}, reverse=True))
     try:
-        md = pymupdf4llm.to_markdown(page.parent, pages=[page.number],
-                                     page_chunks=False, use_ocr=False,
-                                     show_progress=False, write_images=False)
-    except TypeError:  # some versions have no use_ocr keyword
-        md = pymupdf4llm.to_markdown(page.parent, pages=[page.number],
-                                     page_chunks=False, show_progress=False,
-                                     write_images=False)
-    blocks = parse_markdown_blocks(md, page_num=page_num, source="pymupdf4llm")
-    # Map blocks to natural page coordinates, allowing image OCR to be interleaved.
-    text_boxes = [list(x[:4]) for x in page.get_text("blocks", sort=True) if x[6] == 0]
-    for i, block in enumerate(blocks):
-        # Bounding box matching is approximate for multi-line Markdown/table layout.
-        probe = re.sub(r"\s+", " ", block.text).strip()[:55]
+        doc._rag_font_stats = stats
+    except Exception:
+        pass
+    return stats
+
+
+def _join_lines(texts: list[str]) -> str:
+    out = ""
+    for t in texts:
+        frag = out.rsplit(None, 1)[-1][:-1] if out.endswith("-") else ""
+        if frag and out[-2].isalpha() and t[:1].islower():
+            # drop the hyphen only after a plain lowercase fragment; 'BERT-' / 'state-of-the-' keep it, no space
+            out = (out[:-1] if len(frag) >= 2 and frag.isalpha() and frag.islower() else out) + t
+        else:
+            out = f"{out} {t}" if out else t
+    return out
+
+
+def _code_text(grp: list) -> tuple[str, str]:
+    widths = sorted(c["bbox"][2] - c["bbox"][0] for l in grp for s in l.nb for c in s["chars"] if c["c"].strip())
+    cw = widths[len(widths) // 2] if widths else grp[0].size * 0.6
+    rows = []
+    for l in grp:
+        raw = l.raw.replace(" ", " ").expandtabs(4).rstrip()
+        rows.append((l, raw.lstrip(" "), len(raw) - len(raw.lstrip(" "))))
+    m = min((l.x0 for l, _, lead in rows if lead == 0), default=None)
+    inds = [lead if lead or m is None else max(0, round((l.x0 - m) / max(cw, 0.1))) for l, _, lead in rows]
+    cut = min(inds)
+    text = "\n".join(" " * (i - cut) + body for (_, body, _), i in zip(rows, inds))
+    first = rows[0][1]
+    return text, "python" if first.startswith(">>> ") else ("shell" if first.startswith("$ ") else "")
+
+
+def extract_pdf_page(page: Any, page_num: int, asset_dir: Path | str, ocr: Any = None,
+                     stats: dict | None = None) -> list[ContentBlock]:
+    """Blocks of a born-digital page in MuPDF RAW order (never sorted: sort breaks 2-column pages).
+
+    Assets are written as tmp_p<page>_<k>.png in asset_dir; execute() renames them to <block_id>.png.
+    """
+    import pymupdf as fitz
+    asset_dir = Path(asset_dir)
+    W, H = page.rect.width, page.rect.height
+    parea = W * H
+    body, heads = _doc_font_stats(page.parent) if page.parent else (10.0, [])
+    raw = page.get_text("rawdict", flags=fitz.TEXTFLAGS_TEXT | fitz.TEXT_PRESERVE_WHITESPACE
+                        | fitz.TEXT_PRESERVE_IMAGES)
+    lines, images, pos = [], [], 0
+    for bi, b in enumerate(raw["blocks"]):
+        if b["type"] == 1:
+            images.append((pos, tuple(b["bbox"]), b.get("image")))
+            pos += 1
+            continue
+        for l in b.get("lines", []):
+            ln = _make_line(l, bi, pos)
+            pos += 1
+            if ln:
+                lines.append(ln)
+    # Footers: page counters in the bottom 10% only (slide titles live at the top, so no top rule).
+    lines = [l for l in lines if not (l.cy > 0.9 * H and any(p.match(clean_text(l.text)) for p in _FOOTERS))]
+
+    items: list[tuple[float, ContentBlock, tuple]] = []  # (anchor, block, rect)
+    counter = [0]
+
+    def norm(r):
+        return [round(r[0] / W, 5), round(r[1] / H, 5), round(r[2] / W, 5), round(r[3] / H, 5)]
+
+    def save(rect, dpi):
+        counter[0] += 1
+        name = f"tmp_p{page_num:04d}_{counter[0]}.png"
+        clip = fitz.Rect(rect[0] - 3, rect[1] - 3, rect[2] + 3, rect[3] + 3) & page.rect
+        asset_dir.mkdir(parents=True, exist_ok=True)
+        page.get_pixmap(clip=clip, dpi=dpi).save(str(asset_dir / name))
+        return name
+
+    def blk(btype, text, rect, anchor, name=None, **meta):
+        b = make_block(btype, text, page_num=page_num, bbox=norm(rect), asset=f"assets/{name}" if name else None,
+                       source="pymupdf")
+        b.metadata.update(meta)  # not via make_block(**): metadata key 'kind' clashes with its arg
+        b._tmp_asset = name
+        items.append((anchor, b, tuple(rect)))
+        return b
+
+    def take(rect):
+        inside = [l for l in lines if rect[0] <= l.cx <= rect[2] and rect[1] <= l.cy <= rect[3]]
+        ids = {id(l) for l in inside}
+        lines[:] = [l for l in lines if id(l) not in ids]
+        return inside
+
+    def anchor_for(inside, y0):
+        return inside[0].pos if inside else next((l.pos - 0.5 for l in lines if l.y0 >= y0), 1e9)
+
+    # tables
+    table_rects = []
+    try:
+        found = page.find_tables().tables
+    except Exception:
         found = []
-        if probe and block.type != "table":
+    for t in found:
+        if t.row_count < 2 or t.col_count < 2:
+            continue
+        rows = [["" if c is None else str(c) for c in r] for r in t.extract()]
+        # find_tables drops spaces ('Petersetal'): rebuild each cell from our gap-aware line text.
+        for ri, trow in enumerate(t.rows[:len(rows)]):
+            for ci, cb in enumerate(trow.cells[:len(rows[ri])]):
+                if cb is None:
+                    continue
+                got = [l for l in lines if cb[0] <= l.cx <= cb[2] and cb[1] <= l.cy <= cb[3]]
+                if got:
+                    rows[ri][ci] = " ".join(clean_text(l.text) for l in got)
+        if not _has_cells(rows):
+            continue
+        rect = tuple(t.bbox)
+        table_rects.append(rect)
+        inside = take(rect)
+        blk("table", table_to_markdown(rows), rect, anchor_for(inside, rect[1]),
+            rows=rows, n_rows=len(rows), n_cols=max(len(r) for r in rows))
+
+    # vector figures (before formulas, so axis ticks / labels inside a figure never become formulas)
+    def _flat_fill(d):  # fill-only highlight: ~one text line tall/wide, or a wide flat band
+        w, h = d["rect"].width, d["rect"].height
+        return d.get("type") == "f" and not any(it[0] == "c" for it in d["items"]) and (
+            min(w, h) <= 2.5 * body or (w > .5 * W and h < .15 * H))
+    try:
+        alld = page.get_drawings()
+        if len(alld) > MAX_DRAWINGS:
+            dr, vclusters = [], []
+            if stats is not None:
+                stats["drawing_cap_pages"] = stats.get("drawing_cap_pages", 0) + 1
+        else:
+            dr = [d for d in alld if d["rect"].width * d["rect"].height <= .6 * parea
+                  and d["rect"].width <= .95 * W and not _flat_fill(d)]
+            vclusters = page.cluster_drawings(drawings=dr) if dr else []
+    except Exception:
+        dr, vclusters = [], []
+    for r in vclusters:
+        r = tuple(r)
+        area = (r[2] - r[0]) * (r[3] - r[1])
+        mine = [d for d in dr if _within(tuple(d["rect"]), r)]
+        if area < .03 * parea or len(mine) < 5:
+            continue
+        # a figure needs a stroke or curve; plain filled boxes are page decoration
+        if not any(d.get("type") in ("s", "fs") or any(it[0] == "c" for it in d["items"]) for d in mine):
+            continue
+        if any(_hit(r, t) and (min(r[2], t[2]) - max(r[0], t[0])) * (min(r[3], t[3]) - max(r[1], t[1])) > .5 * area
+               for t in table_rects):
+            continue
+        txt = [l for l in lines if r[0] <= l.cx <= r[2] and r[1] <= l.cy <= r[3]]
+        nch = sum(len(l.text) for l in txt)
+        if len(txt) > 5 and nch > 300 and nch >= 20 * len(txt):
+            continue  # body text over a background (long lines); short diagram labels stay in the figure
+        inside = take(r)
+        blk("figure", "", r, anchor_for(inside, r[1]), name=save(r, 150), caption="",
+            ocr_text="\n".join(clean_text(l.text) for l in inside), kind="vector")
+
+    # formulas: seeds clustered by union-find on inflated bboxes
+    seeds = [l for l in lines if l.seed and not _MONO_LINE(l)]
+    par = list(range(len(seeds)))
+
+    def find(i):
+        while par[i] != i:
+            par[i] = par[par[i]]
+            i = par[i]
+        return i
+    infl = [(l.x0 - .5 * l.size, l.y0 - .4 * l.size, l.x1 + .5 * l.size, l.y1 + .4 * l.size) for l in seeds]
+    for i in range(len(seeds)):
+        for j in range(i + 1, len(seeds)):
+            if _hit(infl[i], infl[j]):
+                par[find(j)] = find(i)
+    clusters: dict[int, list] = {}
+    for i, l in enumerate(seeds):
+        clusters.setdefault(find(i), []).append(l)
+    for members in list(clusters.values())[:20]:
+        chars = "".join(m.text for m in members).replace(" ", "")
+        alone = len(members) == 1 and not any(l.midx == members[0].midx for l in lines if l is not members[0])
+        # inline math / ticks: keep as text unless 2+ lines, symbol-heavy, or alone in its block
+        if len(members) < 2 and not alone and sum(not c.isalnum() and c not in ".,;:" for c in chars) < .25 * len(chars):
+            continue
+        rect = (min(m.x0 for m in members), min(m.y0 for m in members),
+                max(m.x1 for m in members), max(m.y1 for m in members))
+        ids = {id(m) for m in members}
+        lines[:] = [l for l in lines if id(l) not in ids]
+        blk("formula", " ".join(m.text for m in members), rect, members[0].pos,
+            name=save(rect, 200), format="text")
+
+    # raster figures
+    for ipos, r, data in images:
+        area = (r[2] - r[0]) * (r[3] - r[1])
+        if area < .008 * parea:  # full-page scans never get here (page-level OCR path)
+            continue
+        text = ""
+        if ocr is not None and data:
             try:
-                found = page.search_for(probe)
+                text = "\n".join(x["text"] for x in ocr.run(data)).strip()
             except Exception:
-                pass
-        if found:
-            block.bbox = [found[0].x0/page.rect.width, found[0].y0/page.rect.height,
-                          found[-1].x1/page.rect.width, found[-1].y1/page.rect.height]
-        elif text_boxes:
-            bbox = text_boxes[min(i, len(text_boxes)-1)]
-            block.bbox = [bbox[0]/page.rect.width, bbox[1]/page.rect.height,
-                          bbox[2]/page.rect.width, bbox[3]/page.rect.height]
-    return blocks
+                text = ""
+        ok = len(re.findall(r"[^\W_]|\s", text)) >= .6 * len(text) and len(re.findall(r"[^\W\d_]{3,}", text)) >= 2
+        blk("figure", "", r, ipos, name=save(r, 150), caption="", ocr_text=text if ok else "", kind="raster")
+
+    # code runs: mono lines, big enough, outside page bands, 2+ close lines or one with code chars
+    prev, runs = None, {}
+    for l in lines:
+        l.code = _MONO_LINE(l) and l.size >= 7 and .05 * H <= l.cy <= .92 * H
+        if l.code:
+            if prev is not None and prev.code and l.y0 - prev.y1 < 1.0 * (l.y1 - l.y0):
+                l.run = prev.run
+            else:
+                l.run = len(runs)
+            runs.setdefault(l.run, []).append(l)
+        prev = l
+    for run in runs.values():
+        if len(run) < 2 and not any(c in l.raw for l in run for c in _CODE_CHARS):
+            for l in run:
+                l.code = False
+
+    slide = W > H
+    first_text = True
+    i = 0
+    while i < len(lines):
+        l0 = lines[i]
+        key = ("c", l0.run) if l0.code else ("t", l0.midx)
+        grp = [l0]
+        i += 1
+        while i < len(lines) and (("c", lines[i].run) if lines[i].code else ("t", lines[i].midx)) == key:
+            grp.append(lines[i])
+            i += 1
+        rect = (min(l.x0 for l in grp), min(l.y0 for l in grp), max(l.x1 for l in grp), max(l.y1 for l in grp))
+        if l0.code:
+            text, lang = _code_text(grp)
+            b = make_block("code", text, page_num=page_num, bbox=norm(rect), verbatim=True,
+                           language=lang, source="pymupdf")
+            b._tmp_asset = None
+            items.append((l0.pos, b, rect))
+            first_text = False
+            continue
+        texts = [clean_text(l.text) for l in grp]
+        joined = _join_lines(texts)
+        size, bold = grp[0].size, all(l.bold for l in grp)
+        is_head = (len(joined) <= 120 and not joined.endswith(".") and (
+            (size >= 1.2 * body and len(grp) <= 3) or (bold and len(grp) == 1)))
+        slide_title = slide and first_text and rect[1] < .2 * H and size >= 1.1 * body and len(joined) <= 120
+        first_text = False
+        if is_head or slide_title:
+            rank = next((k for k, h in enumerate(heads) if abs(h - size) <= .5), len(heads))
+            level = 1 if slide_title else (3 if rank == len(heads) else min(rank + 1, 3))
+            kind, level, txt = detect_type(joined, "heading", level)
+            kind_meta = {"font_size": size, "bold": bold}
+        elif _LIST_MARK.match(texts[0]):
+            items_l: list[str] = []
+            for t in texts:
+                if _LIST_MARK.match(t) or not items_l:
+                    items_l.append(t)
+                else:
+                    items_l[-1] += " " + t  # hanging line joins the previous item
+            kind, level, txt, kind_meta = "list", 0, "\n".join(items_l), {}
+        else:
+            kind, level, txt = detect_type(joined, "paragraph")
+            kind_meta = {"font_size": size, "bold": bold} if kind == "heading" else {}
+        if txt:
+            b = make_block(kind, txt, page_num=page_num, level=level, bbox=norm(rect), source="pymupdf", **kind_meta)
+            b._tmp_asset = None
+            items.append((l0.pos, b, rect))
+
+    # captions: nearest paragraph within 40pt, moved into the figure
+    for _, fig, fr in [x for x in items if x[1].type == "figure"]:
+        best, bd = None, 41.0
+        for it in items:
+            if it[1].type == "paragraph" and _CAPTION.match(it[1].text):
+                r = it[2]
+                d = math.hypot(max(0, r[0] - fr[2], fr[0] - r[2]), max(0, r[1] - fr[3], fr[1] - r[3]))
+                if d <= bd:
+                    best, bd = it, d
+        if best:
+            items.remove(best)
+            fig.metadata["caption"] = best[1].text
+        fig.text = clean(f"{fig.metadata['caption']}\n{fig.metadata['ocr_text']}")
+    items.sort(key=lambda x: x[0])
+    return [b for _, b, _ in items]
+
+
+def _MONO_LINE(l) -> bool:
+    return all(_MONO.search(s["font"]) or s["flags"] & 8 for s in l.nb)
 
 
 def page_has_full_scan(page: Any, text: str) -> bool:
@@ -420,7 +835,7 @@ def page_has_full_scan(page: Any, text: str) -> bool:
     return large_image and len(text.strip()) < 250
 
 
-def parse_pdf(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]]:
+def parse_pdf(path: Path, ocr: OCR, asset_dir: Path | None = None) -> tuple[list[ContentBlock], dict[str, Any]]:
     import pymupdf as fitz
     out: list[ContentBlock] = []
     counts = Counter()
@@ -442,33 +857,21 @@ def parse_pdf(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]]
                 b = ocr_lines_to_blocks(ocr.run(image), page_num=idx)
                 counts["ocr_pages"] += 1
             else:
-                b = get_pdf_text_blocks(p, idx)
+                try:
+                    b = get_pdf_text_blocks(p, idx, ocr, asset_dir, counts)
+                except Exception as e:  # noqa: BLE001 - one bad page must not lose the document
+                    logging.warning("parse_pdf: page %d failed (%s); falling back to plain text", idx, e)
+                    counts["page_errors"] += 1
+                    b = [make_block("paragraph", clean_text(ln), page_num=idx, source="pymupdf")
+                         for ln in p.get_text("text").splitlines() if clean_text(ln)]
+                    for x in b:
+                        x._tmp_asset = None
                 counts["digital_pages"] += 1
-                # Recover OCR text from embedded images in page order.
-                images = p.get_text("dict", sort=True)["blocks"]
-                for item in images:
-                    if item.get("type") != 1 or not item.get("image"):
-                        continue
-                    x0,y0,x1,y1 = item["bbox"]
-                    if (x1-x0)*(y1-y0) < p.rect.width*p.rect.height*0.008:
-                        continue
-                    boxes = ocr_lines_to_blocks(ocr.run(item["image"]), page_num=idx)
-                    for block in boxes:
-                        # Embedded picture yields image_ocr, including inside scanned tables.
-                        block.type = "image_ocr" if block.type not in ("heading", "list") else block.type
-                        if block.bbox:
-                            a,b0,c,d = block.bbox
-                            block.bbox = [round((x0 + a*(x1-x0))/p.rect.width, 5),
-                                          round((y0 + b0*(y1-y0))/p.rect.height, 5),
-                                          round((x0 + c*(x1-x0))/p.rect.width, 5),
-                                          round((y0 + d*(y1-y0))/p.rect.height, 5)]
-                    b.extend(boxes)
-                    counts["image_regions_ocr"] += 1
-                b.sort(key=lambda x: ((x.bbox or [0, 0])[1], (x.bbox or [0, 0])[0]))
+                counts["figures"] += sum(1 for x in b if x.type == "figure")
             if not b:
                 counts["empty_pages"] += 1
             out.extend(b)
-            print(f"[parse] Trang {idx}/{len(doc)}: {OCR_ENGINE_NAME if scanned else 'PyMuPDF4LLM'} - {len(b)} blocks", flush=True)
+            print(f"[parse] Trang {idx}/{len(doc)}: {OCR_ENGINE_NAME if scanned else 'PyMuPDF'} - {len(b)} blocks", flush=True)
     return out, dict(counts)
 
 
@@ -518,6 +921,10 @@ def docx_paragraph_blocks(paragraph: Any, ocr: OCR) -> list[ContentBlock]:
     return results
 
 
+def _has_cells(rows) -> bool:
+    return any(clean(c) for r in rows for c in r)
+
+
 def table_to_markdown(rows: Iterable[Iterable[str]]) -> str:
     safe = [[clean(c).replace("\n", "<br>").replace("|", "\\|") for c in row] for row in rows]
     if not safe:
@@ -550,17 +957,56 @@ def parse_docx(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]
                             snippets.append(b.text)
                     items.append("\n".join(snippets))
                 rows.append(items)
-            out.append(make_block("table", table_to_markdown(rows), source="python-docx"))
+            if _has_cells(rows):
+                out.append(make_block("table", table_to_markdown(rows), source="python-docx"))
     return out, {}
 
 
 def parse_pptx(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]]:
     from pptx import Presentation
-    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
     slides = Presentation(str(path)).slides
     out = []
+    big = 1 << 62
+
     def shapes_in_reading_order(shapes):
-        return sorted(shapes, key=lambda s: (s.top, s.left))
+        # inherited placeholders have None position: keep them after positioned shapes, original order (stable)
+        def pos(v):
+            return big if v is None else v
+        return sorted(shapes, key=lambda s: (pos(s.top), pos(s.left)))
+
+    def num_s(v):
+        return None if v is None else float(format(float(v), ".6g"))
+
+    def chart_block(chart, num):
+        plots = list(chart.plots)
+        cats: list[str] = []
+        try:
+            cats = [str(c) for c in list(plots[0].categories)]
+        except Exception:
+            pass
+        series = []
+        for plot in plots:
+            for s in plot.series:
+                try:
+                    vals = [num_s(v) for v in s.values]
+                except Exception:
+                    vals = []
+                series.append({"name": str(s.name), "values": vals})
+        def fmt(v):
+            return "" if v is None else format(v, ".6g")
+        rows = []
+        for s in series:
+            if cats:
+                body = ", ".join(f"{c}={fmt(v)}" for c, v in zip(cats, s["values"]))
+            else:
+                body = ", ".join(fmt(v) for v in s["values"])
+            rows.append(f"{s['name']}: {body}")
+        fig = make_block("figure", "\n".join(rows), slide_num=num, source="python-pptx")
+        fig.metadata["kind"] = "chart"  # 'kind' is make_block's positional name
+        fig.metadata["chart"] = {"type": str(getattr(chart.chart_type, "name", chart.chart_type)),
+                                 "categories": cats, "series": series}
+        return fig
     def visit(shape, num):
         if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
             for item in shapes_in_reading_order(shape.shapes):
@@ -572,11 +1018,25 @@ def parse_pptx(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]
                 block.metadata["embedded_in"] = "pptx"
                 out.append(block)
             return
+        if getattr(shape, "has_chart", False):
+            try:
+                out.append(chart_block(shape.chart, num))
+            except Exception:
+                pass
+            return
         if shape.has_table:
             rows = [[cell.text for cell in row.cells] for row in shape.table.rows]
-            out.append(make_block("table", table_to_markdown(rows), slide_num=num, source="python-pptx"))
+            if _has_cells(rows):
+                out.append(make_block("table", table_to_markdown(rows), slide_num=num, source="python-pptx"))
             return
         if shape.has_text_frame:
+            is_title = False
+            if shape.is_placeholder:
+                try:
+                    is_title = shape.placeholder_format.type in (
+                        PP_PLACEHOLDER.TITLE, PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.VERTICAL_TITLE)
+                except Exception:
+                    pass
             for i, para in enumerate(shape.text_frame.paragraphs):
                 text = clean(para.text)
                 if not text:
@@ -585,7 +1045,7 @@ def parse_pptx(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]
                 kind, lvl, txt = detect_type(text, "list" if is_bullet else "paragraph")
                 if i == 0 and not is_bullet and para.level == 0 and len(text) < 100:
                     sizes = [r.font.size.pt for r in para.runs if r.font.size]
-                    if sizes and max(sizes) >= 24 and kind == "paragraph":
+                    if kind == "paragraph" and (is_title or (sizes and max(sizes) >= 24)):
                         kind, lvl = "heading", 1
                 out.append(make_block(kind, txt, slide_num=num, level=lvl, source="python-pptx"))
     for num, slide in enumerate(slides, 1):
@@ -608,7 +1068,22 @@ def parse_html(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]
         if not isinstance(el, Tag):
             return
         name = el.name.lower()
-        if name in ("h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "table", "img", "pre", "blockquote"):
+        if name in ("h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "table", "img", "pre", "blockquote", "math"):
+            if name == "pre":
+                code = el.find("code")
+                cls = " ".join((code or el).get("class") or [])
+                lang = (re.search(r"(?:language|lang)-([\w+#.-]+)", cls) or [None, ""])[1]
+                text = (code or el).get_text()
+                if text.strip():
+                    result.append(make_block("code", text, verbatim=True, language=lang, source="beautifulsoup4"))
+                return
+            if name == "math":
+                ann = el.find("annotation", attrs={"encoding": "application/x-tex"})
+                text, fmt = (ann.get_text().strip(), "latex") if ann else (el.get_text(" ", strip=True), "text")
+                if text:
+                    result.append(make_block("formula", text, verbatim=fmt == "latex", format=fmt,
+                                             source="beautifulsoup4"))
+                return
             if name == "img":
                 src = el.get("src") or ""
                 content = None
@@ -629,14 +1104,15 @@ def parse_html(path: Path, ocr: OCR) -> tuple[list[ContentBlock], dict[str, Any]
             if name == "table":
                 rows = [[c.get_text(" ", strip=True) for c in row.find_all(["td", "th"], recursive=False)]
                         for row in el.find_all("tr")]
-                result.append(make_block("table", table_to_markdown(rows), source="beautifulsoup4"))
+                if _has_cells(rows):
+                    result.append(make_block("table", table_to_markdown(rows), source="beautifulsoup4"))
                 return
-            if name in ("p", "li") and el.find(["img", "table"]):
+            if name in ("p", "li") and el.find(["img", "table", "math"]):
                 # Preserve inline images relative to the surrounding text.
                 inline_text: list[str] = []
                 def visit_inline(child):
                     if isinstance(child, Tag):
-                        if child.name == "img":
+                        if child.name in ("img", "math"):
                             if clean(" ".join(inline_text)):
                                 result.append(make_block("paragraph", " ".join(inline_text), source="beautifulsoup4"))
                             inline_text.clear()
@@ -680,7 +1156,7 @@ def remove_repeated_page_noise(blocks: list[ContentBlock]) -> tuple[list[Content
         return re.sub(r"\d+", "#", re.sub(r"\s+", " ", text.casefold())).strip()
     for b in blocks:
         pnum = b.location.get("page_num")
-        if not pnum or not b.bbox or b.type == "heading" or len(b.text) > 100:
+        if not pnum or not b.bbox or b.type in _NO_PRUNE or len(b.text) > 100:
             continue
         at_edge = b.bbox[1] < .11 or b.bbox[3] > .89
         if at_edge:
@@ -691,7 +1167,7 @@ def remove_repeated_page_noise(blocks: list[ContentBlock]) -> tuple[list[Content
     removed = 0
     for b in blocks:
         near_edge = bool(b.bbox and (b.bbox[1] < .11 or b.bbox[3] > .89))
-        if (b.type != "heading" and near_edge and
+        if (b.type not in _NO_PRUNE and near_edge and
             (key(b.text) in repeated or PAGE_NUMBER.fullmatch(b.text.strip()))):
             removed += 1
         else:
@@ -777,7 +1253,7 @@ def execute(src: Path, dest: Path | None = None, force: bool = False,
     if not src.is_file() or src.suffix.lower() not in SUPPORTED:
         raise ValueError(f"Không thấy file hoặc định dạng không được hỗ trợ: {src}")
     if dest is None:
-        dest = src.parent / "processed"
+        dest = src.parent / "processed" / src.stem  # per-document: assets/<block_id>.png must not collide
     dest.mkdir(parents=True, exist_ok=True)
     md_path = dest / f"{src.stem}.md"
     json_path = dest / f"{src.stem}.json"
@@ -785,11 +1261,14 @@ def execute(src: Path, dest: Path | None = None, force: bool = False,
     if not force and md_path.exists() and json_path.exists():
         try:
             cached = json.loads(json_path.read_text(encoding="utf-8"))
-            if cached.get("source", {}).get("sha256") == digest and cached.get("parser_version") == PARSER_VERSION:
+            if (cached.get("source", {}).get("sha256") == digest and cached.get("parser_version") == PARSER_VERSION
+                    and all((dest / b["asset"]).exists() for b in cached.get("blocks", []) if b.get("asset"))):
                 print(f"[parse] CACHE HIT sha256={digest[:12]} | {json_path}")
                 return cached
         except (OSError, ValueError):
             pass
+    for f in (dest / "assets").glob("*.png"):  # stale assets from an earlier parse
+        f.unlink()
     print(f"[parse] START {src.name} | sha256={digest[:12]}", flush=True)
     ext = src.suffix.lower()
     if ext in {".md", ".txt"}:
@@ -799,7 +1278,7 @@ def execute(src: Path, dest: Path | None = None, force: bool = False,
     else:
         engine = ocr or OCR()  # Lazy: import OCR model only when necessary.
         if ext == ".pdf":
-            blocks, stats = parse_pdf(src, engine)
+            blocks, stats = parse_pdf(src, engine, dest / "assets")
         elif ext == ".docx":
             blocks, stats = parse_docx(src, engine)
         elif ext == ".pptx":
@@ -809,6 +1288,14 @@ def execute(src: Path, dest: Path | None = None, force: bool = False,
             stats = {"ocr_images": 1}
     blocks, removed = remove_repeated_page_noise(blocks)
     reconstruct_hierarchy(blocks)
+    # Assets get their final name <block_id>.png now that ids exist; drop orphaned tmp files.
+    for b in blocks:
+        tmp = getattr(b, "_tmp_asset", None)
+        if tmp and (dest / "assets" / tmp).exists():
+            (dest / "assets" / tmp).replace(dest / "assets" / f"{b.id}.png")
+            b.asset = f"assets/{b.id}.png"
+    for f in (dest / "assets").glob("tmp_p*.png"):
+        f.unlink()
     stats["noise_blocks_removed"] = removed
     stats["blocks"] = len(blocks)
     stats["blocks_by_type"] = dict(Counter(b.type for b in blocks))
@@ -828,7 +1315,7 @@ def execute(src: Path, dest: Path | None = None, force: bool = False,
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Unified block parser PDF/DOCX/PPTX/HTML/MD/TXT/Image")
     ap.add_argument("source", type=Path, help="Tệp đầu vào")
-    ap.add_argument("--out-dir", type=Path, default=None, help="Mặc định: <input_parent>/processed")
+    ap.add_argument("--out-dir", type=Path, default=None, help="Mặc định: <input_parent>/processed/<tên file>")
     ap.add_argument("--force", action="store_true", help="Bỏ qua cache SHA-256")
     args = ap.parse_args(argv)
     execute(args.source, args.out_dir, args.force)
