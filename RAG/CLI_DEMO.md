@@ -52,6 +52,15 @@ $env:OPENROUTER_API_KEY = "sk-..."          # tên biến đổi được bằng
 - OCR trang quét cần `TESSDATA_PREFIX` trỏ thư mục có `vie.traineddata`.
 - Chi tiết schema: `docs\PARSER_V3.md`.
 
+## Engine OCR phụ (tùy chọn)
+
+- `ingest --engines off|auto|glm|docling|glm,docling` (mặc định `auto` = chỉ GLM-OCR; Docling là opt-in) và `--engine-budget 45` (giây tối đa cho engine mỗi tài liệu).
+- GLM đọc ảnh công thức thành LaTeX, lưu ở `metadata.latex` (text vẫn là Unicode); bảng dạng ảnh chỉ thêm khi còn >= 25 s ngân sách.
+- Không có engine/venv/trọng số thì bước này tự bỏ qua, ingest vẫn chạy như `--engines off`. Cần tải trước trọng số (`HF_HUB_OFFLINE=1`).
+- Env: `RAG_ENGINES`, `RAG_ENGINE_BUDGET`, `RAG_ENGINE_GLM_PYTHON`, `RAG_ENGINE_DOCLING_PYTHON`, `RAG_ENGINE_TRACE=1` (log thời gian ra stderr).
+- Ví dụ: `& $PY -X utf8 cli.py ingest slide.pdf --store .rag_data\demo --engines glm --engine-budget 45` (bảng cuối có dòng `engine glm ok formulas 36/36 ...`).
+- Cài đặt venv engine: `engines\README.md`. Chi tiết chính sách và số đo: `docs\PARSER_V3.md` mục "Engine router (v3.1.0)".
+
 ## Biến môi trường
 
 `RAG_LLM_MODEL`, `RAG_LLM_BASE_URL`, `RAG_LLM_API_KEY_ENV`, `RAG_LLM_MAX_TOKENS`; stack: `RAG_PG_*`, `RAG_MINIO_*`.

@@ -1,5 +1,7 @@
 # Parser v3: khối nội dung có kiểu (code, công thức, hình, bảng)
 
+> Parser v3.1.0 (`PARSER_VERSION = "3.1.0"`): thêm engine router tùy chọn, xem mục 10. Tên tệp giữ nguyên.
+
 ## 1. Mục đích
 
 Parser v3 (`parser/parse_document.py`, `PARSER_VERSION = "3.0.0"`) chuyển PDF/DOCX/PPTX/HTML/MD/TXT/ảnh thành danh sách khối (`ContentBlock`) theo thứ tự đọc, giữ nguyên code (thụt dòng), công thức, hình và bảng thay vì làm phẳng thành văn bản. Mỗi khối lớn có thể kèm ảnh cắt (asset PNG) để frontend hiển thị. Chunker (`parser/chunker.py`) coi bảng/code/công thức/hình là khối nguyên tử và ghi lại `block_ids`, `assets`, `languages` vào child để truy ngược về khối gốc.
@@ -103,6 +105,34 @@ NFC; bỏ ký tự điều khiển, zero-width, soft hyphen; ligature `ﬁ` thà
 - Hồi quy parser: 20/21 tài liệu mẫu ok (g3 rỗng theo thiết kế).
 - Khối formula: e2 14 -> 1, e1 18 -> 10. Số child a2: 60 -> 50 (do cấu trúc văn bản pháp lý nhiều danh sách, không phải mất chữ: mất chữ đo được <= 0,7% mỗi trang ở e2, <= 0,1% ở a2).
 - Nghiệm thu PDF slide: "Công thức tính trung bình cộng là gì?" trả lời đúng kèm công thức; "Trung vị lương" = 54 đúng; câu hỏi bảng = 230 đúng; câu hỏi trung bình của Messi vẫn từ chối (lỗi truy xuất, mục trung bình xếp hạng 6-7).
+
+## 10. Engine router (v3.1.0)
+
+**Mục đích.** Dùng engine OCR phụ chạy trên GPU để bổ sung cho parser: công thức -> LaTeX, bảng dạng ảnh -> bảng markdown. Tùy chọn: thiếu venv/trọng số thì engine `skipped` và kết quả y hệt `--engines off`.
+
+**Kiến trúc.** Mỗi engine là một tiến trình riêng (`engines/<tên>/worker.py`) trong venv riêng, giao tiếp JSON lines qua stdin/stdout, khởi động lười, giữ ấm trong một lần ingest, đóng trước khi embedding (giải phóng VRAM). Router: `parser/engine_router.py`. Cài đặt: `engines/README.md`.
+
+**Cờ và env.** `--engines off|auto|glm|docling|glm,docling` (`auto` = chỉ GLM; Docling là opt-in), `--engine-budget` (mặc định 45 s). Env: `RAG_ENGINES`, `RAG_ENGINE_BUDGET`, `RAG_ENGINE_GLM_PYTHON`, `RAG_ENGINE_DOCLING_PYTHON`, `RAG_ENGINE_TRACE=1`.
+
+**Ngân sách.** `hiệu_dụng = min(budget, 120 - đã_trôi - 0,28 * số_trang)`; dưới 15 s thì bỏ qua. Hạn cứng = hiệu dụng + 5 s, áp lên cả thời gian chờ handshake lẫn từng request (spawn + nạp mô hình tính vào `used_s`). Nếu ngân sách còn lại nhỏ hơn thời gian nạp đo/seed của engine thì không khởi động. Docling bị bỏ qua nếu chi phí dự kiến > 40% ngân sách còn lại.
+
+**Chính sách theo vùng.**
+- Crop công thức: GLM -> LaTeX lưu ở `metadata.latex`; `text` vẫn là Unicode (chỉ thay bằng LaTeX khi Unicode có < 3 ký tự chữ-số). Crop tầm thường (<= 3 ký tự thường, hoặc cao < 12 pt) bỏ qua; cần >= 3 công thức đáng xử lý. LaTeX bị loại nếu rỗng, quá dài, ngoặc lệch, lặp, hoặc lệch quá nhiều với Unicode (`latex_flags: ["rejected:..."]`).
+- Bảng số trong ảnh: GLM trả bảng HTML, router đổi sang markdown, chỉ nhận khi >= 2 hàng, >= 2 cột và >= 30% từ/số của OCR ảnh có trong bảng (hoặc ảnh không có OCR). Nhận thì thành khối `table` mới ngay sau khối nguồn (`id` = `<nguồn>_e1`, `metadata.engine = "glm"`, `diacritics_risk = true`). Tối đa 3 mỗi tài liệu; không gửi request khi ngân sách còn lại < 25 s.
+- Bảng PDF số có nghi vấn (ô trống/độ lấp đầy thấp): Docling, chỉ khi opt-in; thay thế nếu khớp vị trí (IoU >= 0,5) và >= 90% từ có trong bảng gốc (`metadata.engine = "docling"`, hàng cũ ở `parser_rows`).
+- Trang quét: chỉ Tesseract. Biểu đồ: không engine.
+
+**Cache** ở `<store>/engine_cache` (khóa = sha256 dữ liệu + engine + phiên bản + tham số); thống kê thời gian ở `engine_stats.json`. **Thống kê**: `stats.engines` (mode, budget_s, effective_s, used_s, từng engine: state, s, formula/table done/cached/rejected/skipped), bảng tổng kết của `ingest` có dòng `engine glm ok formulas 36/36 ...` và `engine docling: opt-in`. **Schema thêm**: `metadata.latex`, `metadata.engine`, `metadata.latex_flags`, `metadata.engine` ở khối table, `stats.engines_mode` (đổi chế độ thì cache parse mất hiệu lực).
+
+**Cache parse và phiên bản.** Cache parse chỉ trúng khi `engines_mode` khớp: cài engine sau đó hoặc đổi chế độ thì cần `--force` (hoặc tự parse lại); cache trúng trả về `stats.engines` cũ. Khóa cache engine dùng chuỗi `ENGINE_VERSION` tĩnh: tăng trong `engine_router.py` khi prompt worker hoặc revision mô hình đổi. Chế độ mặc định của CLI/ingest là `auto` (khởi động GLM nếu venv tồn tại; dùng `--engines off` để tắt). `--engine-budget` phải hữu hạn và >= 0 (0 = bỏ qua engine).
+
+**Số đo** (RTX 4050 6 GB, PDF slide `Data-understanding-vi.pdf`, 104 trang):
+- Lần đo trước: off 73 s, auto 113 s (lần 2-3); GLM 36/36 công thức nhận; engine 38,9 s so với ~42 s hiệu dụng. Lần đầu (nguội) mất 175 s vì chờ ready 46 s; nay chờ ready bị chặn ở min(120, còn lại + 5 s).
+- Đo lại sau chỉnh sửa (máy bận hơn, số tuyệt đối dao động): slide off 106 s, auto 128 s (engine 24,4 s, 36/36); e2 bert off 63 s, auto 62 s (không đủ công thức: GLM skipped); a2 pháp lý off 59 s, auto 61 s (không ứng viên). Lần đo trước e2: auto 82 s do Docling spawn 25 s rồi timeout; nay Docling không chạy trong `auto`.
+- Đồng nhất off vs auto (slide, e2, a2): mọi khối không phải formula/table giống hệt (id, type, text, metadata) trừ khóa engine; 0 vi phạm. Slide: 36 formula, text đổi 1 (Unicode < 3 ký tự chữ-số), khối mới 0; children khác 1/108 (chính child chứa formula đó); e2, a2: 0 child khác.
+- Bảng ảnh GLM trên slide (thăm dò riêng, ngân sách 100 s): trang 27 nhận (bảng 7 cột), trang 96 nhận (bảng phân phối), trang 85 bị loại do OCR lệch (OCR của biểu đồ phân tán nhiễu). Nguyên nhân kết quả bị bỏ trước đây: GLM trả HTML `<table>`, bộ lọc cũ chỉ nhận ký tự `|`. Mỗi request 5-17 s. Trong `ingest` mặc định (45 s), công thức dùng hết ~25 s nên còn < 25 s và bảng ảnh không được gửi; muốn dùng cần tăng `--engine-budget`.
+
+**Giới hạn đã biết.** Khởi động nguội (nạp mô hình lần đầu) chậm hơn số đo ấm; chưa mô phỏng được cold start thật, chỉ có test với worker giả (boot 40 s không vượt budget + 5 s). VRAM 2,1-3,2 GB. Bảng do GLM đọc có nguy cơ rơi/sai dấu tiếng Việt (`diacritics_risk`). Lợi ích của Docling chưa được chứng minh (chưa sửa được bảng row-span e1 Bảng 5 / S3-d-009). Giấy phép của mô hình/trọng số chưa được kiểm tra. Trọng số phải tải trước (worker chạy `HF_HUB_OFFLINE=1`). Chưa đo cold start thật và chưa đo lại ingest có bảng ảnh với budget lớn.
 
 ## 9. Kết luận benchmark mô hình (chỉ chạy cục bộ)
 
