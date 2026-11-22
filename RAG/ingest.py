@@ -3,7 +3,9 @@
 Store layout:  <store>/corpus/{children,parents}.jsonl, <store>/documents.json, <store>/parsed/<doc_id>/, <store>/index/
 """
 import hashlib
+import inspect
 import json
+import logging
 import os
 import re
 import shutil
@@ -74,7 +76,29 @@ def _pages(payload, blocks):
 
 
 # ---- one file ----
-def ingest_file(path, store, count_tokens, ceiling=400, force=False, parse_fn=None):
+def make_router(mode, budget_s, store_dir):
+    """-> EngineRouter (cache in <store>/engine_cache) or None when mode is 'off' or the module cannot be imported."""
+    if (mode or "off").strip().lower() == "off":
+        return None
+    try:
+        from parser.engine_router import TARGET_TOTAL_S, EngineRouter
+    except ImportError as e:
+        logging.warning("engine router unavailable (%s); engines off", e)
+        return None
+    if not (0 <= budget_s < float("inf")):  # NaN / negative / inf: 0 = engines skipped
+        budget_s = 0.0
+    return EngineRouter(mode=mode, budget_s=budget_s, cache_dir=Path(store_dir) / "engine_cache", target_total_s=TARGET_TOTAL_S)
+
+
+def _accepts_router(fn):
+    try:
+        ps = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return "router" in ps or any(p.kind is p.VAR_KEYWORD for p in ps.values())
+
+
+def ingest_file(path, store, count_tokens, ceiling=400, force=False, parse_fn=None, router=None):
     """-> result dict. status 'skip' (same sha already ingested) or 'ok'. Raises on parse/chunk failure."""
     if parse_fn is None:
         from parser.parse_document import execute as parse_fn
@@ -87,7 +111,9 @@ def ingest_file(path, store, count_tokens, ceiling=400, force=False, parse_fn=No
         return {"doc_id": doc_id, "path": str(path), "status": "skip", **{k: reg[doc_id].get(k) for k in
                 ("pages", "blocks", "parents", "children", "max_tokens")}, "parse_s": 0, "chunk_s": 0}
     t = time.perf_counter()
-    payload = parse_fn(path, store / "parsed" / doc_id, force)
+    if router is not None:
+        router.doc_start = t  # real elapsed for the budget (enhance() takes max with parse-reported time)
+    payload = parse_fn(path, store / "parsed" / doc_id, force, **({"router": router} if router is not None else {}))
     parse_s = time.perf_counter() - t
     blocks = payload["blocks"]
     t = time.perf_counter()
@@ -105,20 +131,28 @@ def ingest_file(path, store, count_tokens, ceiling=400, force=False, parse_fn=No
     save_registry(store, reg)
     return {"doc_id": doc_id, "path": str(path), "status": "ok", **{k: info[k] for k in
             ("pages", "blocks", "parents", "children", "max_tokens")}, "parse_s": parse_s, "chunk_s": chunk_s,
-            "replaced": stale, "_parsed_dir": str(store / "parsed" / doc_id), "_payload": payload, "_parents": parents, "_children": children}
+            "replaced": stale, "engines": (payload.get("stats") or {}).get("engines"), "_parsed_dir": str(store / "parsed" / doc_id), "_payload": payload, "_parents": parents, "_children": children}
 
 
-def ingest_paths(paths, store, count_tokens, ceiling=400, force=False, parse_fn=None, out=print):
-    """Failure isolation: a document that raises is reported and the others continue. -> list of results."""
+def ingest_paths(paths, store, count_tokens, ceiling=400, force=False, parse_fn=None, out=print,
+                 engines="auto", engine_budget=45.0):
+    """Failure isolation: a document that raises is reported and the others continue. -> list of results.
+    One engine router per run, closed on return (i.e. before the caller embeds: no VRAM held during bge-m3).
+    A custom parse_fn without a `router` parameter gets no router."""
     results = []
-    for p in paths:
-        try:
-            if not Path(p).is_file():
-                raise FileNotFoundError(f"không thấy tệp: {p}")
-            results.append(ingest_file(p, store, count_tokens, ceiling, force, parse_fn))
-        except Exception as e:  # ChunkingError, parse/OCR errors, missing file
-            out(f"!!! THẤT BẠI {p}: {type(e).__name__}: {e}")
-            results.append({"doc_id": None, "path": str(p), "status": "failed", "error": f"{type(e).__name__}: {e}"})
+    router = make_router(engines, engine_budget, store) if parse_fn is None or _accepts_router(parse_fn) else None
+    try:
+        for p in paths:
+            try:
+                if not Path(p).is_file():
+                    raise FileNotFoundError(f"không thấy tệp: {p}")
+                results.append(ingest_file(p, store, count_tokens, ceiling, force, parse_fn, router=router))
+            except Exception as e:  # ChunkingError, parse/OCR errors, missing file
+                out(f"!!! THẤT BẠI {p}: {type(e).__name__}: {e}")
+                results.append({"doc_id": None, "path": str(p), "status": "failed", "error": f"{type(e).__name__}: {e}"})
+    finally:
+        if router is not None:
+            router.close()
     return results
 
 
@@ -268,4 +302,34 @@ def format_table(results, index_s=0.0):
     rows = [[str(x) if x is not None else "-" for x in row] for row in rows]
     w = [max(len(c), *(len(r[i]) for r in rows)) if rows else len(c) for i, c in enumerate(cols)]
     line = lambda row: "  ".join(v.ljust(w[i]) for i, v in enumerate(row))
-    return "\n".join([line(cols), line(["-" * n for n in w])] + [line(r) for r in rows])
+    return "\n".join([line(cols), line(["-" * n for n in w])] + [line(r) for r in rows] + engine_rows(results))
+
+
+def engine_rows(results):
+    """One line per engine actually in play, aggregated over the run's documents. [] when engines were off."""
+    agg = {}
+    for r in results:
+        e = r.get("engines") or {}
+        if e.get("state") == "failed":
+            agg.setdefault("router", []).append({"state": "failed", "reason": e.get("reason", "")})
+        for n, s in (e.get("engines") or {}).items():
+            if s.get("state") != "off":
+                agg.setdefault(n, []).append(s)
+            elif s.get("reason") == "opt-in":
+                agg.setdefault(n, []).append(s)
+    lines = []
+    for n, ss in agg.items():
+        if all(s["state"] == "off" for s in ss):
+            lines.append(f"engine {n}: opt-in (--engines glm,docling)")
+            continue
+        bad = next((s for s in ss if s["state"] in ("failed", "skipped")), None)
+        if bad and not any(s["state"] == "ok" for s in ss):
+            lines.append(f"engine {n} {bad['state']}: {bad.get('reason', '')}")
+            continue
+        f = {k: sum((s.get("formula") or {}).get(k, 0) for s in ss) for k in ("done", "cached", "rejected", "skipped")}
+        t = sum((s.get("table") or {}).get("done", 0) + (s.get("table") or {}).get("cached", 0) for s in ss)
+        t += sum(s.get("tables_replaced", 0) for s in ss)
+        what = (f"formulas {f['done'] + f['cached']}/{sum(f.values())} (cached {f['cached']}, rejected {f['rejected']})  "
+                if sum(f.values()) else "") + (f"tables {t}  " if n == "docling" or t or not sum(f.values()) else "")
+        lines.append(f"engine {n}  ok  {what}{sum(s.get('s', 0) for s in ss):.1f}s")
+    return lines

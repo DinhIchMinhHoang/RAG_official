@@ -271,7 +271,8 @@ def cmd_ingest(a, out=None, err=None):
         except ConnectionError as e:
             print(f"Lỗi Qdrant: {e}", file=err or sys.stderr)
             return 2
-    results = ing.ingest_paths(files, a.store, get_counter(), a.ceiling, a.force, out=emit)
+    results = ing.ingest_paths(files, a.store, get_counter(), a.ceiling, a.force, out=emit,
+                               engines=getattr(a, "engines", "auto"), engine_budget=getattr(a, "engine_budget", 45.0))
     changed = any(r["status"] == "ok" for r in results)
     index_s = 0.0
     try:
@@ -330,6 +331,24 @@ def cmd_info(a, out=None, err=None):
 
 
 # ---- parser ----
+def engines_arg(s):
+    v = s.strip().lower().replace(" ", "")
+    parts = v.split(",")
+    if v in ("off", "auto") or (parts and all(p in ("glm", "docling") for p in parts)):
+        return v
+    raise argparse.ArgumentTypeError(f"engines không hợp lệ: {s!r} (off|auto|glm|docling|glm,docling)")
+
+
+def budget_arg(s):
+    try:
+        v = float(s)
+    except ValueError:
+        v = float("nan")
+    if not (0 <= v < float("inf")):
+        raise argparse.ArgumentTypeError(f"engine-budget phải hữu hạn và >= 0: {s!r} (0 = bỏ qua engine)")
+    return v
+
+
 def build_parser():
     ap = argparse.ArgumentParser(prog="cli.py", description="RAG demo: ingest / ask / chat / info")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -341,6 +360,10 @@ def build_parser():
     i.add_argument("--tessdata", type=Path, default=None, help="thư mục tessdata (TESSDATA_PREFIX) cho OCR")
     i.add_argument("--force", action="store_true", help="bỏ qua cache sha256, ingest lại")
     i.add_argument("--stack", action="store_true", help="đồng bộ thêm vào Postgres + MinIO nếu sẵn sàng")
+    i.add_argument("--engines", type=engines_arg, default=engines_arg(os.environ.get("RAG_ENGINES") or "auto"),
+                   help="engine OCR phụ: off | auto (= glm) | glm | docling | glm,docling; docling là opt-in (env RAG_ENGINES)")
+    i.add_argument("--engine-budget", type=budget_arg, default=os.environ.get("RAG_ENGINE_BUDGET") or "45",
+                   help="giây tối đa cho engine mỗi lần ingest (env RAG_ENGINE_BUDGET)")
     backend = lambda p: p.add_argument("--backend", choices=["faiss", "qdrant"], default="faiss",
                                        help="faiss (tệp cục bộ) | qdrant (docker compose up -d)")
     backend(i)

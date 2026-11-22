@@ -21,10 +21,11 @@ import logging
 import math
 from pathlib import Path
 import re
+import time
 import unicodedata
 from typing import Any, Iterable
 
-PARSER_VERSION = "3.0.0"
+PARSER_VERSION = "3.1.0"
 MIN_PDF_TEXT = 20
 MAX_DRAWINGS = 5000  # per page; above this vector-figure detection is skipped
 MAX_OCR_SIDE = 2400
@@ -640,7 +641,10 @@ def extract_pdf_page(page: Any, page_num: int, asset_dir: Path | str, ocr: Any =
     for t in found:
         if t.row_count < 2 or t.col_count < 2:
             continue
-        rows = [["" if c is None else str(c) for c in r] for r in t.extract()]
+        extracted = t.extract()
+        raw_cells = [c for r in extracted for c in r]
+        none_ratio = sum(1 for c in raw_cells if c is None or not str(c).strip()) / max(1, len(raw_cells))
+        rows = [["" if c is None else str(c) for c in r] for r in extracted]
         # find_tables drops spaces ('Petersetal'): rebuild each cell from our gap-aware line text.
         for ri, trow in enumerate(t.rows[:len(rows)]):
             for ci, cb in enumerate(trow.cells[:len(rows[ri])]):
@@ -655,7 +659,8 @@ def extract_pdf_page(page: Any, page_num: int, asset_dir: Path | str, ocr: Any =
         table_rects.append(rect)
         inside = take(rect)
         blk("table", table_to_markdown(rows), rect, anchor_for(inside, rect[1]),
-            rows=rows, n_rows=len(rows), n_cols=max(len(r) for r in rows))
+            rows=rows, n_rows=len(rows), n_cols=max(len(r) for r in rows),
+            none_ratio=round(none_ratio, 4), fill=round(1 - none_ratio, 4), page=page_num)
 
     # vector figures (before formulas, so axis ticks / labels inside a figure never become formulas)
     def _flat_fill(d):  # fill-only highlight: ~one text line tall/wide, or a wide flat band
@@ -1247,9 +1252,44 @@ def markdown_output(blocks: list[ContentBlock]) -> str:
     return "\n\n".join(output).rstrip() + "\n"
 
 
+def _run_engines(router, blocks, src: Path, dest: Path, elapsed: float, stats: dict) -> list[ContentBlock]:
+    """Engine enhancement of a parsed PDF; never raises. New blocks are spliced after their after_id block."""
+    stats["engines_sig"] = ""
+    try:
+        import pymupdf as fitz
+        with fitz.open(src) as doc:
+            n_pages = len(doc)
+        st = dict(router.enhance(blocks, src, dest, elapsed_s=elapsed, n_pages=n_pages))
+        new = st.pop("new_blocks", None) or []
+        stats["engines_sig"] = st.get("signature", "")
+        by_id = {b.id: i for i, b in enumerate(blocks)}
+        cnt: dict[str, int] = {}
+        fields = set(ContentBlock.__dataclass_fields__)
+        inserts: dict[int, list[ContentBlock]] = {}
+        for nb in new:
+            d = nb if isinstance(nb, dict) else {k: getattr(nb, k) for k in fields if hasattr(nb, k)}
+            aid = d.get("after_id") if isinstance(nb, dict) else getattr(nb, "after_id", None)
+            if aid not in by_id:
+                continue
+            cnt[aid] = cnt.get(aid, 0) + 1
+            anchor = blocks[by_id[aid]]
+            blk = ContentBlock(**{k: v for k, v in d.items() if k in fields and k != "id"}, id=f"{aid}_e{cnt[aid]}")
+            blk.location = dict(blk.location or anchor.location)
+            blk.breadcrumb = blk.breadcrumb or anchor.breadcrumb
+            inserts.setdefault(by_id[aid], []).append(blk)
+        if inserts:
+            blocks = [x for i, b in enumerate(blocks) for x in [b, *inserts.get(i, [])]]
+        stats["engines"] = st
+    except Exception as e:  # noqa: BLE001 - an engine problem must never fail the parse
+        logging.warning("engines failed (%s: %s); keeping parsed blocks", type(e).__name__, e)
+        stats["engines"] = {"state": "failed", "reason": f"{type(e).__name__}: {e}"[:200]}
+    return blocks
+
+
 def execute(src: Path, dest: Path | None = None, force: bool = False,
-            ocr: OCR | None = None) -> dict[str, Any]:
+            ocr: OCR | None = None, router: Any = None) -> dict[str, Any]:
     src = src.resolve()
+    t_start = time.perf_counter()
     if not src.is_file() or src.suffix.lower() not in SUPPORTED:
         raise ValueError(f"Không thấy file hoặc định dạng không được hỗ trợ: {src}")
     if dest is None:
@@ -1262,6 +1302,7 @@ def execute(src: Path, dest: Path | None = None, force: bool = False,
         try:
             cached = json.loads(json_path.read_text(encoding="utf-8"))
             if (cached.get("source", {}).get("sha256") == digest and cached.get("parser_version") == PARSER_VERSION
+                    and cached.get("stats", {}).get("engines_mode", "off") == (router.mode if router is not None else "off")
                     and all((dest / b["asset"]).exists() for b in cached.get("blocks", []) if b.get("asset"))):
                 print(f"[parse] CACHE HIT sha256={digest[:12]} | {json_path}")
                 return cached
@@ -1296,6 +1337,9 @@ def execute(src: Path, dest: Path | None = None, force: bool = False,
             b.asset = f"assets/{b.id}.png"
     for f in (dest / "assets").glob("tmp_p*.png"):
         f.unlink()
+    stats["engines_mode"] = router.mode if router is not None else "off"
+    if router is not None and ext == ".pdf":
+        blocks = _run_engines(router, blocks, src, dest, time.perf_counter() - t_start, stats)
     stats["noise_blocks_removed"] = removed
     stats["blocks"] = len(blocks)
     stats["blocks_by_type"] = dict(Counter(b.type for b in blocks))
