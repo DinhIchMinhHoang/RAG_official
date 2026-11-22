@@ -44,6 +44,14 @@ $env:OPENROUTER_API_KEY = "sk-..."          # tên biến đổi được bằng
 & $PY -X utf8 cli.py info --store .rag_data\demo       # tài liệu, manifest, cấu hình (đã ẩn bí mật), GPU
 ```
 
+## Nội dung có kiểu (parser v3)
+
+- Dòng nguồn của `ask` và `/sources` có nhãn `[hình]`, `[công thức]`, `[mã]`, `[bảng]` khi đoạn khớp chứa loại đó.
+- `--json`: mỗi nguồn có thêm `types`, `assets` (`block_id`, `type`, `asset`, `bbox`, `page`) và `languages` khi có.
+- Ảnh cắt (công thức, hình) nằm ở `<store>\parsed\<doc_id>\assets\<block_id>.png`; khối đầy đủ ở `<store>\parsed\<doc_id>\<tên>.json`.
+- OCR trang quét cần `TESSDATA_PREFIX` trỏ thư mục có `vie.traineddata`.
+- Chi tiết schema: `docs\PARSER_V3.md`.
+
 ## Biến môi trường
 
 `RAG_LLM_MODEL`, `RAG_LLM_BASE_URL`, `RAG_LLM_API_KEY_ENV`, `RAG_LLM_MAX_TOKENS`; stack: `RAG_PG_*`, `RAG_MINIO_*`.

@@ -9,7 +9,7 @@ Nhánh `refactor/generic-rag-local-models` so với `main` (commit `ca50150`). N
 |---|---|
 | Mục tiêu | Chuyển pipeline RAG từ "chỉ ăn Quy chế có cấu trúc Điều/Khoản" sang pipeline tổng quát (PDF scan, PDF text, DOCX, HTML, MD, mã nguồn, bảng, công thức), nhiều tài liệu trong một store, chỉ dùng MỘT API trả phí dạng text. |
 | Phạm vi | `RAG/` (parser, chunker, embed, llm, store, deploy, tests, CLI). Không đụng `RAG/api.py`, `RAG/eval/`, `front_end`, test split. |
-| Trạng thái | Code xong, 121 unit test chạy (118 pass, 3 skip: cần Postgres/MinIO/Qdrant thật). Chưa commit (xem Phụ lục). Chưa có thay đổi nào cho `api.py` và `llm/{retrieve,rerank,prompt,generate}.py`: các file này vẫn là bản cũ, cục bộ cho Quy chế. |
+| Trạng thái | Code xong, 154 unit test chạy (151 pass, 3 skip: cần Postgres/MinIO/Qdrant thật). 4 commit refactor đã đẩy lên; parser v3 chưa commit (xem mục "Cập nhật: parser v3"). Chưa có thay đổi nào cho `api.py` và `llm/{retrieve,rerank,prompt,generate}.py`: các file này vẫn là bản cũ, cục bộ cho Quy chế. |
 | Kết quả chính | Ingest 17/17 tài liệu (cũ 2/17). End-to-end 107/115 = 0.930 trên S1-S4 dev, 0 hallucination trên 20 câu không có đáp án, chi phí ~$0.00004/câu. Điểm yếu: S4 0.762. |
 
 ## 2. Chính sách thiết kế
@@ -316,7 +316,7 @@ $env:OPENROUTER_API_KEY = "<key>"          # tên biến này là RAG_LLM_API_KE
 | Backend lưu trữ | Tệp cục bộ (`data/indexes/*`, FAISS + BM25) | FAISS cục bộ (mặc định) hoặc Qdrant; tuỳ chọn mirror Postgres + MinIO | `ingest.py`, `store/`, `deploy/` |
 | Nhiều tài liệu | Một corpus Quy chế, không `doc_id` ở truy vấn | `doc_id` mọi nơi, registry, `--doc` lọc, thay thế khi nguồn đổi, bỏ qua theo sha256 | `ingest.py` |
 | CLI | Không có (chỉ `api.py`) | `cli.py ingest/ask/chat/info` | `cli.py`, `CLI_DEMO.md` |
-| Test | Không có thư mục tests trên `main` | 121 test unit (3 skip) | mục 8.2 |
+| Test | Không có thư mục tests trên `main` | 154 test unit (3 skip) | mục 8.2 |
 | Requirements / pin | `requirements.txt` chỉ cận dưới, thiếu storage/pytesseract/transformers | thêm `pytesseract`, `transformers`, `qdrant-client`, `psycopg[binary]`, `minio`; `requirements.lock.txt` ghim đủ phiên bản | `git diff -- RAG/requirements.txt` |
 | Git hygiene | Không `.gitignore`; track `data/`, `.pyc` | Thêm `RAG/.gitignore` (`__pycache__/`, `*.pyc`, `.env`, `.rag_data/`, `data/`, `results/`) và `RAG/.gitattributes`; file đã track vẫn cần `git rm --cached` (19 `.pyc` + `data/...`) | `git ls-files` |
 | Chi phí mỗi câu | ~$0.001 (gemini-2.5-flash) | ~$0.00004 (`qwen/qwen3.7-flash`, reasoning `none`; 3.470 prompt + 117 completion token) | số đo của dự án; xem mục 7 |
@@ -439,7 +439,7 @@ OCR: cần Tesseract + `vie.traineddata`; đặt `TESSERACT_CMD`, `TESSDATA_PREF
 
 ### 8.2 Kết quả unit test (chạy 2026-11-22, `env -u RAG_LLM_*`)
 
-Lệnh: `python -X utf8 -m unittest discover -s tests -v` (cwd `RAG`). Kết quả: `Ran 121 tests in 7.467s`, `OK (skipped=3)`.
+Lệnh: `python -X utf8 -m unittest discover -s tests -v` (cwd `RAG`). Kết quả đo ngày 2026-11-22 khi chưa có parser v3: `Ran 121 tests in 7.467s`, `OK (skipped=3)`; bảng dưới là số liệu đó. Hiện tại (có test parser v3): 154 test, 3 skip.
 
 | Module | Chạy | Pass | Skip |
 |---|---|---|---|
@@ -489,6 +489,17 @@ Ngoài ra `git ls-files` còn track tổng cộng 19 file `.pyc` và `RAG/data/*
 | `pytesseract` | `>=0.3.10` (mới) | `==0.3.13` |
 | `transformers` | không ràng buộc (mới) | `==5.23.0` |
 | Khác (đã có) | giữ nguyên, thêm chú thích nhóm | ghim: `torch==2.14.1+cu126`, `sentence-transformers==5.7.0`, `faiss-cpu==1.16.0`, `rank-bm25==0.2.2`, `underthesea==9.5.0`, `numpy==2.5.5`, ... |
+
+## Cập nhật: parser v3
+
+Chi tiết kỹ thuật, schema khối và giới hạn: [PARSER_V3.md](PARSER_V3.md).
+
+- Parser v3 (`PARSER_VERSION 3.0.0`) tạo khối có kiểu `code`, `formula`, `figure` (kèm asset PNG), `table` có `rows`; chunker coi các kiểu này là nguyên tử và ghi `block_ids`, `assets`, `languages` vào child. CLI hiện nhãn `[hình]/[công thức]/[mã]/[bảng]` ở nguồn.
+- Test hiện tại: 154 test, 3 skip (thêm các file test parser/chunker/ingest cho asset và khối).
+- Đo trên mẫu nhỏ: S2 quote-hit@3 0,933 -> 0,933; S3 0,913 -> 0,957 (22/23, một lật S3-d-009); parser 20/21 tài liệu mẫu ok.
+- Giới hạn chính: chưa sinh LaTeX; bảng row-span bị làm phẳng; biểu đồ ảnh không có giá trị số.
+- Benchmark mô hình OCR/công thức (cục bộ, mẫu nhỏ): chưa thêm mô hình nào vào pipeline; Tesseract giữ cho trang quét.
+- Trạng thái git: 4 commit refactor đã đẩy; thay đổi parser v3 (`cli.py`, `ingest.py`, `parser/*`, test mới, tài liệu này) chưa commit cho tới khi người dùng commit.
 
 ## Đối chiếu (brief so với tệp kết quả / code)
 
