@@ -1,0 +1,7 @@
+*.jsonl text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.faiss binary
+*.npy binary
+*.pyc binary

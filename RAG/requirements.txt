@@ -1,7 +1,9 @@
+# parsing / OCR
 pymupdf>=1.24
 pymupdf4llm>=0.0.17
 rapidocr-onnxruntime>=1.4.4
 onnxruntime>=1.17
+pytesseract>=0.3.10
 numpy>=1.26,<3
 Pillow>=10.0
 python-docx>=1.1
@@ -9,9 +11,16 @@ python-pptx>=1.0
 beautifulsoup4>=4.12
 markdownify>=0.13
 charset-normalizer>=3.3
+# embedding / search
 sentence-transformers>=3.4,<6
 faiss-cpu>=1.9,<2
 rank-bm25==0.2.2
 underthesea>=6.8,<10
+transformers
+# api
 fastapi>=0.115,<1
 uvicorn[standard]>=0.30,<1
+# storage backends
+qdrant-client>=1.15
+psycopg[binary]>=3.2
+minio>=7.2

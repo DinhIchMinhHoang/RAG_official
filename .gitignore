@@ -1,2 +1,7 @@
 node_modules/
 dist/
+# research workspace and personal tooling
+RAG_lab/
+.agents/
+.claude/
+skills-lock.json
