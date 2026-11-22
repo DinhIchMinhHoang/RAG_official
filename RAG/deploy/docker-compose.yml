@@ -1,0 +1,36 @@
+# All ports bound to 127.0.0.1. Secrets come from ./.env (copy .env.example).
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.20.0  # client qdrant-client 1.20 requires server within one minor version
+    restart: unless-stopped
+    ports: ["127.0.0.1:6333:6333", "127.0.0.1:6334:6334"]
+    volumes: ["qdrant_data:/qdrant/storage"]
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]  # named volume: initdb chmod fails on Windows bind mounts
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  minio:
+    # minio/minio (Docker Hub) and quay.io/minio/minio are no longer pullable (checked 2026-11-22 with
+    # `docker manifest inspect`); Chainguard builds MinIO from source. Only :latest is free: pin a digest later.
+    image: cgr.dev/chainguard/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
+    volumes: ["minio_data:/data"]  # non-root image: a named volume avoids Windows bind-mount permission errors
+volumes:
+  qdrant_data:
+  postgres_data:
+  minio_data:
